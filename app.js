@@ -1,27 +1,26 @@
 function initMap() {
   // Create the map.
   const map = new google.maps.Map(document.getElementById('map'), {
-    zoom: 7,
-    center: {lat: 52.632469, lng: -1.689423},
+    zoom: 5,
+    center: {lat: 39.8097343, lng: -98.5556199}
   });
 
   // Load the stores GeoJSON onto the map.
-  map.data.loadGeoJson('stores.json', {idPropertyName: 'storeid'});
+  map.data.loadGeoJson('stores.json', {idPropertyName: 'name'});
 
   const apiKey = 'AIzaSyA-RKDKkA8LwduBk95geB5wntBRtMsYQmU';
   const infoWindow = new google.maps.InfoWindow();
 
   // Show the information for a store when its marker is clicked.
   map.data.addListener('click', (event) => {
-    const category = event.feature.getProperty('category');
     const name = event.feature.getProperty('name');
-    const description = event.feature.getProperty('description');
-    const hours = event.feature.getProperty('hours');
-    const phone = event.feature.getProperty('phone');
+    const address = event.feature.getProperty('address');
+    const hours = event.feature.getProperty('phone');
+    const phone = event.feature.getProperty('hours');
     const position = event.feature.getGeometry().get();
     const content = `
-      <h2>${name}</h2><p>${description}</p>
-      <p><b>Open:</b> ${hours}<br/><b>Phone:</b> ${phone}</p>
+      <h2>${name}</h2><p>${address}</p>
+      <p><b>${hours}<br/>${phone}</p>
     `;
 
     infoWindow.setContent(content);
@@ -38,7 +37,7 @@ function initMap() {
   const input = document.createElement('input');
   const options = {
     types: ['address'],
-    componentRestrictions: {country: 'gb'},
+    componentRestrictions: {country: 'us'},
   };
 
   card.setAttribute('id', 'pac-card');
@@ -82,7 +81,7 @@ function initMap() {
     // Recenter the map to the selected address
     originLocation = place.geometry.location;
     map.setCenter(originLocation);
-    map.setZoom(9);
+    map.setZoom(13);
     console.log(place);
 
     originMarker.setPosition(originLocation);
@@ -92,67 +91,103 @@ function initMap() {
     // to each of the store locations
     const rankedStores = await calculateDistances(map.data, originLocation);
     showStoresList(map.data, rankedStores);
-
     return;
+
   });
 
 }
 
+
+function haversineDistance(lat1, lng1, lat2, lng2) {
+  const R = 6371e3; // Earth's radius in meters
+  const toRad = deg => deg * Math.PI / 180;
+
+  const dLat = toRad(lat2 - lat1);
+  const dLng = toRad(lng2 - lng1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLng / 2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return R * c;
+}
 
 async function calculateDistances(data, origin) {
-  const stores = [];
-  const destinations = [];
+  const originLat = origin.lat();
+  const originLng = origin.lng();
+  const nearbyStores = [];
 
-  // Build parallel arrays for the store IDs and destinations
+  // Step 1: Filter all stores using Haversine (cheap, fast)
   data.forEach((store) => {
-    const storeNum = store.getProperty('storeid');
-    const storeLoc = store.getGeometry().get();
+    const name = store.getProperty("name");
+    const geometry = store.getGeometry().get();
 
-    stores.push(storeNum);
-    destinations.push(storeLoc);
-  });
+    if (geometry) {
+      const lat = geometry.lat();
+      const lng = geometry.lng();
+      const distance = haversineDistance(originLat, originLng, lat, lng);
 
-  // Retrieve the distances of each store from the origin
-  // The returned list will be in the same order as the destinations list
-  const service = new google.maps.DistanceMatrixService();
-  const getDistanceMatrix =
-    (service, parameters) => new Promise((resolve, reject) => {
-      service.getDistanceMatrix(parameters, (response, status) => {
-        if (status != google.maps.DistanceMatrixStatus.OK) {
-          reject(response);
-        } else {
-          const distances = [];
-          const results = response.rows[0].elements;
-          for (let j = 0; j < results.length; j++) {
-            const element = results[j];
-            const distanceText = element.distance.text;
-            const distanceVal = element.distance.value;
-            const distanceObject = {
-              storeid: stores[j],
-              distanceText: distanceText,
-              distanceVal: distanceVal,
-            };
-            distances.push(distanceObject);
-          }
-
-          resolve(distances);
-        }
+      nearbyStores.push({
+        storeName: name,
+        lat,
+        lng,
+        distance,
+        geometry
       });
-    });
-
-  const distancesList = await getDistanceMatrix(service, {
-    origins: [origin],
-    destinations: destinations,
-    travelMode: 'DRIVING',
-    unitSystem: google.maps.UnitSystem.METRIC,
+    }
   });
 
-  distancesList.sort((first, second) => {
-    return first.distanceVal - second.distanceVal;
+  // Step 2: Sort by straight-line distance
+  nearbyStores.sort((a, b) => a.distance - b.distance);
+
+  // Step 3: Limit to top 25 stores
+  const filteredStores = nearbyStores.slice(0, 25);
+
+  const destinations = filteredStores.map(s => new google.maps.LatLng(s.lat, s.lng));
+  const storeNames = filteredStores.map(s => s.storeName);
+
+  // Step 4: Call Distance Matrix for refined driving distances
+  const service = new google.maps.DistanceMatrixService();
+
+  const results = await new Promise((resolve, reject) => {
+    service.getDistanceMatrix(
+      {
+        origins: [origin],
+        destinations: destinations,
+        travelMode: "DRIVING",
+        unitSystem: google.maps.UnitSystem.IMPERIAL,
+      },
+      (response, status) => {
+        if (status !== "OK") {
+          console.error("DistanceMatrixService error:", status);
+          reject(new Error("Distance Matrix failed: " + status));
+          return;
+        }
+
+        const distances = [];
+        const elements = response.rows[0].elements;
+
+        for (let i = 0; i < elements.length; i++) {
+          const el = elements[i];
+          if (el.status === "OK") {
+            distances.push({
+              storeName: storeNames[i],
+              distanceText: el.distance.text,
+              distanceVal: el.distance.value
+            });
+          }
+        }
+
+        resolve(distances);
+      }
+    );
   });
 
-  return distancesList;
+  // Step 5: Sort again by driving distance and return top 5
+  results.sort((a, b) => a.distanceVal - b.distanceVal);
+  return results.slice(0, 10);
 }
+
 
 
 function showStoresList(data, stores) {
@@ -185,7 +220,7 @@ function showStoresList(data, stores) {
     // Add store details with text formatting
     const name = document.createElement('p');
     name.classList.add('place');
-    const currentStore = data.getFeatureById(store.storeid);
+    const currentStore = data.getFeatureById(store.storeName);
     name.textContent = currentStore.getProperty('name');
     panel.appendChild(name);
     const distanceText = document.createElement('p');
